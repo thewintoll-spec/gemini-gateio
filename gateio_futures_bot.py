@@ -130,8 +130,9 @@ class GateioFuturesClient:
             if float(current_position_size) != 0:
                 print(f"  --> 기존 포지션 청산 시도: {contract}, Size: {current_position_size}")
                 # 현재 포지션의 반대 방향으로 주문을 넣어 청산
-                close_size = -float(current_position_size)
-                close_order = self.create_order(contract, close_size, price='0', is_close=True)
+                # API는 정수형 문자열을 기대하므로 float을 int로 변환
+                close_size = -int(float(current_position_size))
+                close_order = self.create_order(contract, str(close_size), price='0', is_close=True)
                 if close_order and close_order.status == 'filled':
                     print(f"  --> 포지션 청산 완료. 청산 가격: {close_order.fill_price}")
                     return True
