@@ -14,7 +14,7 @@
 
 - Python 3.x
 - 다음 Python 라이브러리가 필요합니다.
-  - `gate-api-python`
+  - `gate-api`
   - `pandas`
   - `pandas-ta`
 
@@ -24,7 +24,7 @@
     터미널(명령 프롬프트)에 다음 명령어를 입력하여 필요한 라이브러리를 설치합니다.
 
     ```sh
-    pip install gate-api-python pandas pandas-ta
+    pip install gate-api pandas pandas-ta
     ```
 
 2.  **API 키 설정:**
