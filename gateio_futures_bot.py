@@ -21,8 +21,8 @@ CANDLE_LIMIT = 100 # 최근 100개 캔들 데이터 사용
 ADX_THRESHOLD = 25 # ADX가 이 값보다 높으면 추세장, 낮으면 횡보장
 FAST_EMA_PERIOD = 9
 SLOW_EMA_PERIOD = 21
-BB_PERIOD = 20
-BB_STD = 2
+BNF_EMA_PERIOD = 25  # BNF 전략용 EMA 주기
+BNF_DEVIATION_PERCENT = 1.5 # BNF 전략용 이격도 (%)
 
 
 def setup_gateio_client():
@@ -129,17 +129,27 @@ class GateioFuturesClient:
         try:
             if float(current_position_size) != 0:
                 print(f"  --> 기존 포지션 청산 시도: {contract}, Size: {current_position_size}")
-                # 현재 포지션의 반대 방향으로 주문을 넣어 청산
-                # API는 정수형 문자열을 기대하므로 float을 int로 변환
-                close_size = -int(float(current_position_size))
-                close_order = self.create_order(contract, str(close_size), price='0', is_close=True)
-                if close_order and close_order.status == 'filled':
-                    print(f"  --> 포지션 청산 완료. 청산 가격: {close_order.fill_price}")
+                # 포지션 청산을 위해 size=0, is_close=True로 설정
+                order_req = gate_api.FuturesOrder(contract=contract, size="0", tif='ioc', is_close=True)
+                created_order = self.futures_api.create_futures_order(settle=SETTLE_CURRENCY, futures_order=order_req)
+                print(f"  --> 포지션 청산 주문 생성: {contract}, status: {created_order.status}")
+                log_trade(created_order, contract)
+
+                # 주문이 완전히 체결되었는지 확인
+                time.sleep(2) # API가 주문 상태를 업데이트할 시간을 줌
+                final_order = self.futures_api.get_futures_order(settle=SETTLE_CURRENCY, order_id=created_order.id)
+                if final_order.status == 'finished' and final_order.finish_as == 'filled':
+                    print(f"  --> 포지션 청산 완료. 청산 가격: {final_order.fill_price}")
                     return True
+                else:
+                    print(f"  --> 포지션 청산 주문이 완전히 체결되지 않았습니다: {final_order.status}, {final_order.finish_as}")
+                    return False
             return False
+        except GateApiException as e:
+            print(f"  --> 포지션 청산 중 API 오류: {e.label}, {e.message}")
         except Exception as e:
-            print(f"  --> 포지션 청산 중 오류: {e}")
-            return False
+            print(f"  --> 포지션 청산 중 예기치 않은 오류: {e}")
+        return False
 
     def get_candlesticks(self, contract, interval=CANDLE_INTERVAL, limit=CANDLE_LIMIT):
         try:
@@ -161,13 +171,9 @@ class TradingBot:
         self.adx_threshold = ADX_THRESHOLD
         self.fast_ema_period = FAST_EMA_PERIOD
         self.slow_ema_period = SLOW_EMA_PERIOD
-        self.bb_period = BB_PERIOD
-        self.bb_std = BB_STD
-        
-        # 이전 캔들 데이터 (이동평균 교차 감지용)
-        self.prev_ema_fast = None
-        self.prev_ema_slow = None
-        
+        self.bnf_ema_period = BNF_EMA_PERIOD
+        self.bnf_deviation = BNF_DEVIATION_PERCENT
+
         # 잔고 및 레버리지 설정
         try:
             self.client.futures_api.update_position_leverage(
@@ -230,58 +236,43 @@ class TradingBot:
         last_adx = df['ADX_14'].dropna().iloc[-1]
         last_close = df['close'].iloc[-1]
         
-        bb_std_float = float(self.bb_std)
-        # 표준 컬럼 이름과 이상하게 생성된 컬럼 이름을 모두 준비
-        std_bbl_col = f'BBL_{self.bb_period}_{bb_std_float}'
-        std_bbm_col = f'BBM_{self.bb_period}_{bb_std_float}'
-        std_bbu_col = f'BBU_{self.bb_period}_{bb_std_float}'
+        # BNF 스타일: 25-EMA와 이격도 계산
+        ema_bnf = df[f'EMA_{self.bnf_ema_period}'].dropna().iloc[-1]
+        deviation = (last_close / ema_bnf - 1) * 100 # 이격도 (%)
         
-        mangled_bbl_col = f'BBL_{self.bb_period}_{bb_std_float}_{bb_std_float}'
-        mangled_bbm_col = f'BBM_{self.bb_period}_{bb_std_float}_{bb_std_float}'
-        mangled_bbu_col = f'BBU_{self.bb_period}_{bb_std_float}_{bb_std_float}'
+        upper_band_price = ema_bnf * (1 + self.bnf_deviation / 100)
+        lower_band_price = ema_bnf * (1 - self.bnf_deviation / 100)
 
-        # DataFrame에 실제 있는 컬럼 이름으로 접근
-        if mangled_bbl_col in df.columns:
-            bbl_col, bbm_col, bbu_col = mangled_bbl_col, mangled_bbm_col, mangled_bbu_col
-        else:
-            bbl_col, bbm_col, bbu_col = std_bbl_col, std_bbm_col, std_bbu_col
-            
-        last_bb_lower = df[bbl_col].iloc[-1]
-        last_bb_upper = df[bbu_col].iloc[-1]
-        last_bb_middle = df[bbm_col].iloc[-1]
-        
-        # 이전 캔들 데이터를 사용하여 교차 발생 여부 확인
-        prev_close = df['close'].iloc[-2]
+        print(f"  [BNF 횡보 전략] ADX: {last_adx:.2f}, 현재가: {last_close:.2f}, 25-EMA: {ema_bnf:.2f}, 이격도: {deviation:.2f}%")
+        print(f"  [BNF 횡보 전략] 매수 목표가(하단): < {lower_band_price:.2f}, 매도 목표가(상단): > {upper_band_price:.2f}")
 
-        print(f"  [횡보 전략] ADX: {last_adx:.2f}, 현재가: {last_close:.2f}, BB_Lower: {last_bb_lower:.2f}, BB_Upper: {last_bb_upper:.2f}")
-
-        # 롱 포지션 진입/청산
-        if last_close < last_bb_lower and prev_close >= last_bb_lower: # 가격이 하단 밴드를 하향 돌파
+        # 롱 포지션 진입/청산 (과매도 후 평균 회귀)
+        if last_close < lower_band_price:
             if position_size == 0:
-                print(f"  --> 볼린저밴드 하단 이탈! 롱 포지션 진입 시도. Size: {trade_size}")
+                print(f"  --> BNF: 과매도 감지 (이격도: {deviation:.2f}%)! 롱 포지션 진입 시도. Size: {trade_size}")
                 self.client.create_order(self.contract, trade_size, price='0')
-            elif position_size < 0: # 숏 포지션 보유 중이면 청산 후 롱 진입
-                print(f"  --> 볼린저밴드 하단 이탈! 기존 숏 포지션 청산 후 롱 포지션 진입 시도. Size: {trade_size}")
-                if self.client.close_position(self.contract, position_size):
+            elif position_size < 0:
+                 print(f"  --> BNF: 과매도 감지! 기존 숏 포지션 청산 후 롱 포지션 진입 시도. Size: {trade_size}")
+                 if self.client.close_position(self.contract, position_size):
                     self.client.create_order(self.contract, trade_size, price='0')
-        elif position_size > 0 and last_close > last_bb_middle: # 롱 포지션 보유 중 가격이 중간 밴드를 상향 돌파
-            print("  --> 볼린저밴드 중간선 돌파! 기존 롱 포지션 청산 시도.")
+        elif position_size > 0 and last_close > ema_bnf: # 롱 포지션 보유 중, 가격이 EMA 위로 복귀하면 청산
+            print(f"  --> BNF: 평균 회귀 감지! 기존 롱 포지션 청산 시도.")
             self.client.close_position(self.contract, position_size)
 
-        # 숏 포지션 진입/청산
-        elif last_close > last_bb_upper and prev_close <= last_bb_upper: # 가격이 상단 밴드를 상향 돌파
+        # 숏 포지션 진입/청산 (과매수 후 평균 회귀)
+        elif last_close > upper_band_price:
             if position_size == 0:
-                print(f"  --> 볼린저밴드 상단 이탈! 숏 포지션 진입 시도. Size: {-trade_size}")
+                print(f"  --> BNF: 과매수 감지 (이격도: {deviation:.2f}%)! 숏 포지션 진입 시도. Size: {-trade_size}")
                 self.client.create_order(self.contract, -trade_size, price='0')
-            elif position_size > 0: # 롱 포지션 보유 중이면 청산 후 숏 진입
-                print(f"  --> 볼린저밴드 상단 이탈! 기존 롱 포지션 청산 후 숏 포지션 진입 시도. Size: {-trade_size}")
-                if self.client.close_position(self.contract, position_size):
+            elif position_size > 0:
+                 print(f"  --> BNF: 과매수 감지! 기존 롱 포지션 청산 후 숏 포지션 진입 시도. Size: {-trade_size}")
+                 if self.client.close_position(self.contract, position_size):
                     self.client.create_order(self.contract, -trade_size, price='0')
-        elif position_size < 0 and last_close < last_bb_middle: # 숏 포지션 보유 중 가격이 중간 밴드를 하향 돌파
-            print("  --> 볼린저밴드 중간선 하향 돌파! 기존 숏 포지션 청산 시도.")
+        elif position_size < 0 and last_close < ema_bnf: # 숏 포지션 보유 중, 가격이 EMA 아래로 복귀하면 청산
+            print(f"  --> BNF: 평균 회귀 감지! 기존 숏 포지션 청산 시도.")
             self.client.close_position(self.contract, position_size)
         else:
-            print("  --> 횡보 전략: 매매 신호 없음.")
+            print("  --> BNF 횡보 전략: 매매 신호 없음.")
 
     def run(self):
         print(f"\n[{datetime.datetime.now()}] --- 선물 트레이딩 전략 실행 ---")
@@ -290,7 +281,7 @@ class TradingBot:
         position_size = float(position.size) if position else 0
 
         klines = self.client.get_candlesticks(self.contract, CANDLE_INTERVAL, CANDLE_LIMIT)
-        if not klines or len(klines) < max(self.bb_period, self.slow_ema_period, 14, 2):
+        if not klines or len(klines) < max(self.bnf_ema_period, self.slow_ema_period, 14, 2):
             print(f"  [{self.contract}] 기술적 지표 계산에 필요한 데이터 부족.")
             return
 
@@ -302,7 +293,7 @@ class TradingBot:
         df.ta.adx(length=14, append=True)
         df.ta.ema(length=self.fast_ema_period, append=True)
         df.ta.ema(length=self.slow_ema_period, append=True)
-        df.ta.bbands(length=self.bb_period, std=self.bb_std, append=True)
+        df.ta.ema(length=self.bnf_ema_period, append=True)
         
         # 동적 주문 수량 계산
         trade_size = 0
@@ -310,13 +301,9 @@ class TradingBot:
             balance = self.client.get_balance()
             current_price = df['close'].iloc[-1]
             if balance > 0 and current_price > 0:
-                # 사용 가능한 잔고의 95%를 증거금으로 사용
                 margin_to_use = balance * 0.95
-                # 레버리지를 적용한 총 포지션 가치
                 target_nominal_value = margin_to_use * self.leverage
-                # 1 계약(contract)의 가치는 0.0001 BTC. 이를 USDT로 환산.
-                # 총 포지션 가치를 (현재가 * 0.0001)로 나누어 계약 수 계산
-                # контракт 당 0.0001 BTC
+                # 1 계약(contract)의 가치는 0.0001 BTC
                 contract_value_in_usdt = current_price * 0.0001 
                 if contract_value_in_usdt > 0:
                     trade_size = int(target_nominal_value / contract_value_in_usdt)
@@ -327,19 +314,9 @@ class TradingBot:
             print("  [경고] 계산된 주문 수량이 1계약보다 작아 주문을 실행하지 않습니다.")
             return
 
-        bb_std_float = float(self.bb_std)
-        required_cols_mangled = [
-            'ADX_14', f'EMA_{self.fast_ema_period}', f'EMA_{self.slow_ema_period}', 
-            f'BBL_{self.bb_period}_{bb_std_float}_{bb_std_float}', 
-            f'BBU_{self.bb_period}_{bb_std_float}_{bb_std_float}', 
-            f'BBM_{self.bb_period}_{bb_std_float}_{bb_std_float}'
-        ]
-        required_cols_std = [
-            'ADX_14', f'EMA_{self.fast_ema_period}', f'EMA_{self.slow_ema_period}', 
-            f'BBL_{self.bb_period}_{bb_std_float}', f'BBU_{self.bb_period}_{bb_std_float}', f'BBM_{self.bb_period}_{bb_std_float}'
-        ]
+        required_cols = ['ADX_14', f'EMA_{self.fast_ema_period}', f'EMA_{self.slow_ema_period}', f'EMA_{self.bnf_ema_period}']
         
-        if not (all(col in df.columns for col in required_cols_mangled) or all(col in df.columns for col in required_cols_std)):
+        if not all(col in df.columns for col in required_cols):
             print("  [오류] 일부 기술적 지표가 DataFrame에 추가되지 않았습니다. 컬럼:", df.columns.tolist())
             return
             
