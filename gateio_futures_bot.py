@@ -38,8 +38,16 @@ def get_top_traded_contracts(futures_api, settle, n=10):
         all_tickers = futures_api.list_futures_tickers(settle=settle)
         # 24시간 거래대금(volume_24h_usd)을 기준으로 내림차순 정렬 (None 값은 0으로 처리)
         sorted_tickers = sorted(all_tickers, key=lambda x: float(x.volume_24h_usd or 0), reverse=True)
-        top_n_names = [t.contract for t in sorted_tickers[:n]]
-        print(f"거래량 상위 {n}개 코인: {top_n_names}")
+        
+        # ASCII 이름만 가진 코인을 필터링
+        top_n_names = []
+        for t in sorted_tickers:
+            if t.contract.isascii():
+                top_n_names.append(t.contract)
+            if len(top_n_names) == n:
+                break
+        
+        print(f"거래량 상위 {n}개 코인 (ASCII 필터링): {top_n_names}")
         return top_n_names
     except ApiException as e:
         print(f"Gate.io API 오류 (상위 코인 조회): {e}")
@@ -49,7 +57,7 @@ def get_top_traded_contracts(futures_api, settle, n=10):
 
 def log_trade(order, contract):
     file_exists = os.path.isfile('trade_history.csv')
-    with open('trade_history.csv', 'a', newline='') as f:
+    with open('trade_history.csv', 'a', newline='', encoding='utf-8') as f:
         if not file_exists:
             f.write("Timestamp,Type,Size,Price,Contract\n")
         order_size_float = float(order.size)
@@ -60,7 +68,7 @@ def log_trade(order, contract):
 
 def log_pnl(position, contract):
     file_exists = os.path.isfile('pnl_over_time.csv')
-    with open('pnl_over_time.csv', 'a', newline='') as f:
+    with open('pnl_over_time.csv', 'a', newline='', encoding='utf-8') as f:
         if not file_exists:
             f.write("Timestamp,UnrealisedPNL,Size,EntryPrice,Contract\n")
         if position and float(position.size) != 0:
@@ -182,8 +190,13 @@ class TradingBot:
         if not all(col in df.columns for col in required_cols):
             print(f"  [{contract}] 오류: 일부 기술적 지표가 DataFrame에 추가되지 않았습니다.")
             return
+
+        adx_series = df['ADX_14'].dropna()
+        if adx_series.empty:
+            print(f"  [{contract}] ADX 계산에 유효한 데이터가 부족하여 건너뜁니다.")
+            return
             
-        last_adx = df['ADX_14'].dropna().iloc[-1]
+        last_adx = adx_series.iloc[-1]
         market_regime = "TRENDING" if last_adx > self.adx_threshold else "RANGING"
         print(f"  [시장 분석] ADX(14): {last_adx:.2f}, 현재 시장: {market_regime}")
 
