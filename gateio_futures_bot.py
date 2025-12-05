@@ -154,7 +154,7 @@ class TradingBot:
                 print(f"  {contract}: 레버리지 설정 중 오류: {e}")
         print("--- 레버리지 설정 완료 ---\n")
 
-    def run_strategy_for_contract(self, contract):
+    def run_strategy_for_contract(self, contract, total_open_positions):
         print(f"--- [{contract}] 트레이딩 전략 실행 ---")
         
         position = self.client.get_position(contract)
@@ -172,20 +172,6 @@ class TradingBot:
         df.ta.ema(length=self.slow_ema_period, append=True)
         df.ta.ema(length=self.bnf_ema_period, append=True)
         
-        trade_size = 0
-        if position_size == 0:
-            balance = self.client.get_balance()
-            current_price = df['close'].iloc[-1]
-            if balance > 0 and current_price > 0:
-                # 전체 잔고의 (5% / TOP_N_CONTRACTS) 만큼을 각 코인에 할당하여 증거금으로 사용
-                margin_per_coin = (balance * 0.05) / len(self.contracts)
-                target_nominal_value = margin_per_coin * self.leverage
-                
-                # BTC/ETH와 기타 알트코인의 계약 단위를 고려해야 함. 
-                # 여기서는 모든 코인의 계약 단위를 1로 가정 (1 USD)
-                # 실제로는 contract_val 등을 API로 조회하여 정확히 계산해야 함
-                trade_size = target_nominal_value / current_price
-
         required_cols = ['ADX_14', f'EMA_{self.fast_ema_period}', f'EMA_{self.slow_ema_period}', f'EMA_{self.bnf_ema_period}']
         if not all(col in df.columns for col in required_cols):
             print(f"  [{contract}] 오류: 일부 기술적 지표가 DataFrame에 추가되지 않았습니다.")
@@ -200,60 +186,117 @@ class TradingBot:
         market_regime = "TRENDING" if last_adx > self.adx_threshold else "RANGING"
         print(f"  [시장 분석] ADX(14): {last_adx:.2f}, 현재 시장: {market_regime}")
 
-        if market_regime == "TRENDING":
-            self.execute_trend_strategy(df, contract, position_size, trade_size)
+        # 포지션이 있을 경우, 청산 로직을 먼저 확인
+        if position_size != 0:
+            if market_regime == "TRENDING":
+                self.execute_trend_exit(df, contract, position_size)
+            else:
+                self.execute_bnf_exit(df, contract, position_size)
+        
+        # 포지션이 없을 경우, 진입 로직 확인
         else:
-            self.execute_bnf_strategy(df, contract, position_size, trade_size)
+            if total_open_positions >= 2:
+                print("  [포트폴리오] 최대 보유 포지션(2개)에 도달하여 신규 진입하지 않습니다.")
+                return
 
-    def execute_trend_strategy(self, df, contract, position_size, trade_size):
+            margin_percent = 0.50 if total_open_positions == 0 else 0.95
+            
+            balance = self.client.get_balance()
+            current_price = df['close'].iloc[-1]
+            trade_size = 0
+            if balance > 0 and current_price > 0:
+                margin_to_use = balance * margin_percent
+                target_nominal_value = margin_to_use * self.leverage
+                trade_size = target_nominal_value / current_price # 계약 단위가 1 USD라고 가정
+
+            if trade_size < 1:
+                print(f"  [경고] 계산된 주문 수량({trade_size:.4f})이 1보다 작아 주문을 실행하지 않습니다.")
+                return
+            
+            print(f"  [자금 관리] 총 보유 포지션: {total_open_positions}개 -> {margin_percent*100}% 마진 사용 (주문 수량: {trade_size:.4f})")
+
+            if market_regime == "TRENDING":
+                self.execute_trend_entry(df, contract, trade_size)
+            else:
+                self.execute_bnf_entry(df, contract, trade_size)
+
+
+    def execute_trend_exit(self, df, contract, position_size):
         last_ema_fast = df[f'EMA_{self.fast_ema_period}'].iloc[-1]
         last_ema_slow = df[f'EMA_{self.slow_ema_period}'].iloc[-1]
         prev_ema_fast = df[f'EMA_{self.fast_ema_period}'].iloc[-2]
         prev_ema_slow = df[f'EMA_{self.slow_ema_period}'].iloc[-2]
 
-        print(f"  [추세 전략] EMA_Fast: {last_ema_fast:.2f}, EMA_Slow: {last_ema_slow:.2f}")
+        if position_size > 0 and last_ema_fast < last_ema_slow and prev_ema_fast >= prev_ema_slow:
+            print(f"  [추세-청산] 데드 크로스! 기존 롱 포지션 청산.")
+            self.client.close_position(contract)
+        elif position_size < 0 and last_ema_fast > last_ema_slow and prev_ema_fast <= prev_ema_slow:
+            print(f"  [추세-청산] 골든 크로스! 기존 숏 포지션 청산.")
+            self.client.close_position(contract)
 
-        if last_ema_fast > last_ema_slow and prev_ema_fast <= prev_ema_slow and position_size <= 0:
-            if position_size < 0: self.client.close_position(contract)
+    def execute_trend_entry(self, df, contract, trade_size):
+        last_ema_fast = df[f'EMA_{self.fast_ema_period}'].iloc[-1]
+        last_ema_slow = df[f'EMA_{self.slow_ema_period}'].iloc[-1]
+        prev_ema_fast = df[f'EMA_{self.fast_ema_period}'].iloc[-2]
+        prev_ema_slow = df[f'EMA_{self.slow_ema_period}'].iloc[-2]
+        
+        print(f"  [추세-진입] EMA_Fast: {last_ema_fast:.2f}, EMA_Slow: {last_ema_slow:.2f}")
+
+        if last_ema_fast > last_ema_slow and prev_ema_fast <= prev_ema_slow:
             print(f"  --> 골든 크로스! 롱 포지션 진입. Size: {trade_size:.4f}")
             self.client.create_order(contract, trade_size)
-        elif last_ema_fast < last_ema_slow and prev_ema_fast >= prev_ema_slow and position_size >= 0:
-            if position_size > 0: self.client.close_position(contract)
+        elif last_ema_fast < last_ema_slow and prev_ema_fast >= prev_ema_slow:
             print(f"  --> 데드 크로스! 숏 포지션 진입. Size: {-trade_size:.4f}")
             self.client.create_order(contract, -trade_size)
         else:
-            print("  --> 추세 전략: 신호 없음.")
+            print("  --> 추세 전략: 진입 신호 없음.")
 
-    def execute_bnf_strategy(self, df, contract, position_size, trade_size):
+    def execute_bnf_exit(self, df, contract, position_size):
         last_close = df['close'].iloc[-1]
         ema_bnf = df[f'EMA_{self.bnf_ema_period}'].dropna().iloc[-1]
-        deviation = (last_close / ema_bnf - 1) * 100
-        upper_band_price = ema_bnf * (1 + self.bnf_deviation / 100)
-        lower_band_price = ema_bnf * (1 - self.bnf_deviation / 100)
-
-        print(f"  [BNF 횡보 전략] 현재가: {last_close:.2f}, {self.bnf_ema_period}-EMA: {ema_bnf:.2f}, 이격도: {deviation:.2f}%")
-
-        if last_close < lower_band_price and position_size <= 0:
-            if position_size < 0: self.client.close_position(contract)
-            print(f"  --> BNF: 과매도! 롱 포지션 진입. Size: {trade_size:.4f}")
-            self.client.create_order(contract, trade_size)
-        elif last_close > upper_band_price and position_size >= 0:
-            if position_size > 0: self.client.close_position(contract)
-            print(f"  --> BNF: 과매수! 숏 포지션 진입. Size: {-trade_size:.4f}")
-            self.client.create_order(contract, -trade_size)
-        elif position_size > 0 and last_close > ema_bnf:
+        
+        if position_size > 0 and last_close > ema_bnf:
             print("  --> BNF: 평균 회귀! 롱 포지션 청산.")
             self.client.close_position(contract)
         elif position_size < 0 and last_close < ema_bnf:
             print("  --> BNF: 평균 회귀! 숏 포지션 청산.")
             self.client.close_position(contract)
+
+    def execute_bnf_entry(self, df, contract, trade_size):
+        last_close = df['close'].iloc[-1]
+        ema_bnf = df[f'EMA_{self.bnf_ema_period}'].dropna().iloc[-1]
+        upper_band_price = ema_bnf * (1 + self.bnf_deviation / 100)
+        lower_band_price = ema_bnf * (1 - self.bnf_deviation / 100)
+        
+        print(f"  [BNF-진입] 현재가: {last_close:.2f}, {self.bnf_ema_period}-EMA: {ema_bnf:.2f}")
+
+        if last_close < lower_band_price:
+            print(f"  --> BNF: 과매도! 롱 포지션 진입. Size: {trade_size:.4f}")
+            self.client.create_order(contract, trade_size)
+        elif last_close > upper_band_price:
+            print(f"  --> BNF: 과매수! 숏 포지션 진입. Size: {-trade_size:.4f}")
+            self.client.create_order(contract, -trade_size)
         else:
-            print("  --> BNF 횡보 전략: 신호 없음.")
+            print("  --> BNF 횡보 전략: 진입 신호 없음.")
 
     def run(self):
+        # 1. 전체 포지션 현황 파악
+        open_positions = []
         for contract in self.contracts:
-            self.run_strategy_for_contract(contract)
-            time.sleep(1) # 각 코인별 API 호출 사이에 약간의 딜레이
+            pos = self.client.get_position(contract)
+            if pos and float(pos.size) != 0:
+                open_positions.append(pos)
+            time.sleep(0.1) # API 호출 간 짧은 딜레이
+
+        total_open_positions = len(open_positions)
+        print(f"\n[포트폴리오 현황] 총 보유 포지션: {total_open_positions}개")
+        for pos in open_positions:
+            print(f"  - {pos.contract}: {pos.size} 계약")
+
+        # 2. 각 코인에 대한 전략 실행
+        for contract in self.contracts:
+            self.run_strategy_for_contract(contract, total_open_positions)
+            time.sleep(0.5) # 각 코인별 API 호출 사이에 약간의 딜레이
 
 if __name__ == "__main__":
     client_config = setup_gateio_client()
