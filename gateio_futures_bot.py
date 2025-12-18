@@ -6,6 +6,8 @@ import datetime
 import pandas as pd
 import pandas_ta as ta
 
+LOG_DIR = ""
+
 # --- 설정 ---
 TESTNET_API_URL = "https://api-testnet.gateapi.io/api/v4"
 API_KEY = "cb872a645c4afcdf0de204cf34eae039"
@@ -18,7 +20,7 @@ CANDLE_INTERVAL = '5m' # 5분봉 사용
 CANDLE_LIMIT = 100 # 최근 100개 캔들 데이터 사용
 
 # 고정된 거래 코인 목록 (사용자 요청)
-CONTRACTS_TO_TRADE = ['BTC_USDT', 'ETH_USDT', 'XRP_USDT', 'SOL_USDT', 'SUI_USDT', 'LINK_USDT', 'DOGE_USDT']
+CONTRACTS_TO_TRADE = ['BTC_USDT', 'ETH_USDT']
 
 # 계약별 승수 (contract multiplier) - Gate.io API 문서 기반
 # 1 계약이 몇 코인 단위를 의미하는지
@@ -88,8 +90,9 @@ def setup_gateio_client():
     return config
 
 def log_trade(order, contract):
-    file_exists = os.path.isfile('trade_history.csv')
-    with open('trade_history.csv', 'a', newline='', encoding='utf-8') as f:
+    file_path = os.path.join(LOG_DIR, 'trade_history.csv')
+    file_exists = os.path.isfile(file_path)
+    with open(file_path, 'a', newline='', encoding='utf-8') as f:
         if not file_exists:
             f.write("Timestamp,Type,Size,Price,Contract\n")
         order_size_float = float(order.size)
@@ -99,8 +102,9 @@ def log_trade(order, contract):
         f.write(log_entry)
 
 def log_pnl(position, contract):
-    file_exists = os.path.isfile('pnl_over_time.csv')
-    with open('pnl_over_time.csv', 'a', newline='', encoding='utf-8') as f:
+    file_path = os.path.join(LOG_DIR, 'pnl_over_time.csv')
+    file_exists = os.path.isfile(file_path)
+    with open(file_path, 'a', newline='', encoding='utf-8') as f:
         if not file_exists:
             f.write("Timestamp,UnrealisedPNL,Size,EntryPrice,Contract\n")
         if position and float(position.size) != 0:
@@ -147,7 +151,21 @@ class GateioFuturesClient:
     def close_position(self, contract):
         try:
             print(f"  --> {contract} 포지션 청산 시도...")
-            order_req = gate_api.FuturesOrder(contract=contract, size="0", tif='ioc', is_close=True)
+            position = self.get_position(contract)
+            if not position or float(position.size) == 0:
+                print(f"  --> {contract} 청산할 포지션이 없습니다.")
+                return None
+
+            # 보유 포지션의 반대 수량으로 청산 주문 생성
+            close_order_size = -int(float(position.size))
+
+            order_req = gate_api.FuturesOrder(
+                contract=contract,
+                size=str(close_order_size),
+                price='0',
+                tif='ioc',
+                is_close=True
+            )
             created_order = self.futures_api.create_futures_order(settle=SETTLE_CURRENCY, futures_order=order_req)
             log_trade(created_order, contract)
             return created_order
@@ -365,6 +383,12 @@ class TradingBot:
 
 if __name__ == "__main__":
     client_config = setup_gateio_client()
+    
+    # Create a unique log directory for this run
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    LOG_DIR = os.path.join("logs", timestamp)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    print(f"로그 폴더 생성: {LOG_DIR}")
     
     while True:
         print("\n--- Gate.io 선물 자동매매 봇 시작 (Testnet) ---")
